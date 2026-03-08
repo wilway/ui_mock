@@ -1,3 +1,12 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#ifndef _WIN32_IE
+#define _WIN32_IE 0x0600
+#endif
+#ifndef WINVER
+#define WINVER 0x0600
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -20,6 +29,17 @@
 #define ID_BTN_CLEAR  110
 #define ID_BTN_SAVE   111
 
+#define ID_BTN_IMPORTS 112
+#define ID_TXT_PE      113
+#define ID_BTN_PE      114
+#define ID_TAB_PE      401
+#define ID_LST_IMPORTS 402
+#define ID_LST_EXPORTS 403
+
+#ifndef LVGS_COLLAPSIBLE
+#define LVGS_COLLAPSIBLE 8
+#endif
+
 #define ID_LST_PROCS  201
 #define ID_BTN_SEL_PROC 202
 #define ID_TXT_SEARCH 203
@@ -32,6 +52,7 @@
 // 全局句柄与变量
 HWND hLog;
 HWND hTxtDll;
+HWND hTxtPe;
 HWND hTxtProc;
 HWND hProcDlg = NULL;
 HWND hModDlg = NULL;
@@ -229,6 +250,10 @@ bool InjectRemoteDLL_CRT(DWORD processID, const wchar_t* dllPath) {
         CloseHandle(hProcess);
         return false;
     }
+
+    VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+    CloseHandle(hProcess);
+    return true;
 }
 
 bool IsDll64Bit(const wchar_t* dllPath, bool& is64Bit) {
@@ -707,6 +732,273 @@ LRESULT CALLBACK ProcDlgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// PE Analyzer 子窗口回调函数
+LRESULT CALLBACK ImportsDlgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HWND hOwner = GetWindow(hwnd, GW_OWNER);
+            if (hOwner) {
+                RECT rcOwner, rcDlg;
+                GetWindowRect(hOwner, &rcOwner);
+                GetWindowRect(hwnd, &rcDlg);
+                int dlgWidth = rcDlg.right - rcDlg.left;
+                int dlgHeight = rcDlg.bottom - rcDlg.top;
+                int x = rcOwner.left + (rcOwner.right - rcOwner.left - dlgWidth) / 2;
+                int y = rcOwner.top + (rcOwner.bottom - rcOwner.top - dlgHeight) / 2;
+                SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+            }
+
+            // Create Tab Control
+            HWND hTab = CreateWindowExW(0, WC_TABCONTROL, L"", WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE,
+                0, 0, 0, 0, hwnd, (HMENU)ID_TAB_PE, g_hInst, NULL);
+
+            TCITEMW tie;
+            tie.mask = TCIF_TEXT;
+            tie.pszText = (LPWSTR)L"Imports";
+            SendMessageW(hTab, TCM_INSERTITEMW, 0, (LPARAM)&tie);
+            tie.pszText = (LPWSTR)L"Exports";
+            SendMessageW(hTab, TCM_INSERTITEMW, 1, (LPARAM)&tie);
+
+            // Create List Views
+            HWND hListImp = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEW, L"",
+                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+                0, 0, 0, 0, hwnd, (HMENU)ID_LST_IMPORTS, g_hInst, NULL);
+            HWND hListExp = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEW, L"",
+                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS, // Hidden initially
+                0, 0, 0, 0, hwnd, (HMENU)ID_LST_EXPORTS, g_hInst, NULL);
+
+            ListView_SetExtendedListViewStyle(hListImp, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+            ListView_SetExtendedListViewStyle(hListExp, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+            LVCOLUMNW lvc = { 0 };
+            lvc.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM;
+            lvc.fmt = LVCFMT_LEFT;
+            
+            lvc.iSubItem = 0; lvc.cx = 120; lvc.pszText = (LPWSTR)L"Address"; ListView_InsertColumn(hListImp, 0, &lvc);
+            lvc.iSubItem = 1; lvc.cx = 60;  lvc.pszText = (LPWSTR)L"Ordinal"; ListView_InsertColumn(hListImp, 1, &lvc);
+            lvc.iSubItem = 2; lvc.cx = 250; lvc.pszText = (LPWSTR)L"Name";    ListView_InsertColumn(hListImp, 2, &lvc);
+            lvc.iSubItem = 3; lvc.cx = 150; lvc.pszText = (LPWSTR)L"Library"; ListView_InsertColumn(hListImp, 3, &lvc);
+
+            SendMessage(hListImp, LVM_ENABLEGROUPVIEW, TRUE, 0);
+
+            lvc.iSubItem = 0; lvc.cx = 250; lvc.pszText = (LPWSTR)L"Name";    ListView_InsertColumn(hListExp, 0, &lvc);
+            lvc.iSubItem = 1; lvc.cx = 120; lvc.pszText = (LPWSTR)L"Address"; ListView_InsertColumn(hListExp, 1, &lvc);
+            lvc.iSubItem = 2; lvc.cx = 60;  lvc.pszText = (LPWSTR)L"Ordinal"; ListView_InsertColumn(hListExp, 2, &lvc);
+
+            wchar_t szDll[MAX_PATH] = { 0 };
+            GetWindowTextW(hTxtPe, szDll, MAX_PATH);
+
+            HANDLE hFile = CreateFileW(szDll, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+                if (hMap) {
+                    void* pBase = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+                    if (pBase) {
+                        PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pBase;
+                        if (pDos->e_magic == IMAGE_DOS_SIGNATURE) {
+                            PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)((BYTE*)pBase + pDos->e_lfanew);
+                            if (pNt->Signature == IMAGE_NT_SIGNATURE) {
+                                auto RvaToOffset = [&](DWORD rva) -> DWORD {
+                                    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+                                    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSec++) {
+                                        if (rva >= pSec->VirtualAddress && rva < pSec->VirtualAddress + pSec->Misc.VirtualSize) {
+                                            return rva - pSec->VirtualAddress + pSec->PointerToRawData;
+                                        }
+                                    }
+                                    return 0;
+                                };
+                                bool is64 = (pNt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 || pNt->FileHeader.Machine == IMAGE_FILE_MACHINE_IA64);
+
+                                // 1. Parse Imports
+                                DWORD importRVA = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                                if (importRVA) {
+                                    DWORD importOffset = RvaToOffset(importRVA);
+                                    if (importOffset) {
+                                        PIMAGE_IMPORT_DESCRIPTOR pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)pBase + importOffset);
+                                        int groupId = 1;
+                                        int itemIndex = 0;
+
+                                        while (pImportDesc->Name) {
+                                            DWORD nameOffset = RvaToOffset(pImportDesc->Name);
+                                            char* dllNameA = (char*)pBase + nameOffset;
+                                            wchar_t dllNameW[MAX_PATH];
+                                            MultiByteToWideChar(CP_ACP, 0, dllNameA, -1, dllNameW, MAX_PATH);
+
+                                            LVGROUP lvg = { 0 };
+                                            lvg.cbSize = sizeof(LVGROUP);
+                                            lvg.mask = LVGF_HEADER | LVGF_GROUPID | LVGF_STATE;
+                                            lvg.pszHeader = dllNameW;
+                                            lvg.iGroupId = groupId;
+                                            lvg.state = LVGS_COLLAPSIBLE;
+                                            SendMessageW(hListImp, LVM_INSERTGROUP, -1, (LPARAM)&lvg);
+
+                                            DWORD thunkRVA = pImportDesc->OriginalFirstThunk ? pImportDesc->OriginalFirstThunk : pImportDesc->FirstThunk;
+                                            DWORD thunkOffset = RvaToOffset(thunkRVA);
+                                            DWORD iatRVA = pImportDesc->FirstThunk;
+
+                                            if (thunkOffset) {
+                                                void* pThunk = (BYTE*)pBase + thunkOffset;
+                                                DWORD currentIatRva = iatRVA;
+
+                                                while (true) {
+                                                    ULONGLONG val = 0;
+                                                    if (is64) {
+                                                        val = *(ULONGLONG*)pThunk;
+                                                        pThunk = (ULONGLONG*)pThunk + 1;
+                                                    } else {
+                                                        val = *(DWORD*)pThunk;
+                                                        pThunk = (DWORD*)pThunk + 1;
+                                                    }
+                                                    if (!val) break;
+
+                                                    wchar_t szAddr[64], szOrdinal[64], szName[MAX_PATH];
+                                                    ULONGLONG addr = pNt->OptionalHeader.ImageBase + currentIatRva;
+                                                    wsprintfW(szAddr, is64 ? L"%016I64X" : L"%08I64X", addr);
+
+                                                    lstrcpyW(szOrdinal, L"");
+                                                    lstrcpyW(szName, L"");
+
+                                                    bool isOrdinal = is64 ? (val & IMAGE_ORDINAL_FLAG64) : (val & IMAGE_ORDINAL_FLAG32);
+                                                    if (isOrdinal) {
+                                                        DWORD ord = val & 0xFFFF;
+                                                        wsprintfW(szOrdinal, L"%lu", ord);
+                                                    } else {
+                                                        DWORD hintNameOffset = RvaToOffset((DWORD)(val & 0x7FFFFFFF));
+                                                        if (hintNameOffset) {
+                                                            PIMAGE_IMPORT_BY_NAME pByName = (PIMAGE_IMPORT_BY_NAME)((BYTE*)pBase + hintNameOffset);
+                                                            wsprintfW(szOrdinal, L"%u", pByName->Hint);
+                                                            MultiByteToWideChar(CP_ACP, 0, pByName->Name, -1, szName, MAX_PATH);
+                                                        }
+                                                    }
+
+                                                    LVITEMW lvi = { 0 };
+                                                    lvi.mask = LVIF_TEXT | LVIF_GROUPID;
+                                                    lvi.iItem = itemIndex;
+                                                    lvi.iSubItem = 0;
+                                                    lvi.pszText = szAddr;
+                                                    lvi.iGroupId = groupId;
+                                                    int inserted = SendMessageW(hListImp, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+
+                                                    lvi.mask = LVIF_TEXT;
+                                                    lvi.iItem = inserted;
+                                                    lvi.iSubItem = 1; lvi.pszText = szOrdinal; SendMessageW(hListImp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+                                                    lvi.iSubItem = 2; lvi.pszText = szName;    SendMessageW(hListImp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+                                                    lvi.iSubItem = 3; lvi.pszText = dllNameW;  SendMessageW(hListImp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+
+                                                    itemIndex++;
+                                                    currentIatRva += is64 ? 8 : 4;
+                                                }
+                                            }
+                                            pImportDesc++;
+                                            groupId++;
+                                        }
+                                    }
+                                }
+
+                                // 2. Parse Exports
+                                DWORD exportRVA = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                                if (exportRVA) {
+                                    DWORD exportOffset = RvaToOffset(exportRVA);
+                                    if (exportOffset) {
+                                        PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)pBase + exportOffset);
+                                        DWORD* pFunctions = (DWORD*)((BYTE*)pBase + RvaToOffset(pExportDir->AddressOfFunctions));
+                                        DWORD* pNames = (DWORD*)((BYTE*)pBase + RvaToOffset(pExportDir->AddressOfNames));
+                                        WORD* pNameOrdinals = (WORD*)((BYTE*)pBase + RvaToOffset(pExportDir->AddressOfNameOrdinals));
+                                        
+                                        int expItemIndex = 0;
+                                        for (DWORD i = 0; i < pExportDir->NumberOfFunctions; ++i) {
+                                            if (pFunctions[i] == 0) continue; // Skip empty slots
+                                            
+                                            DWORD currentRva = pFunctions[i];
+                                            ULONGLONG addr = pNt->OptionalHeader.ImageBase + currentRva;
+                                            wchar_t szAddr[64], szOrdinal[64], szName[MAX_PATH];
+                                            wsprintfW(szAddr, is64 ? L"%016I64X" : L"%08I64X", addr);
+                                            wsprintfW(szOrdinal, L"%u", pExportDir->Base + i);
+                                            lstrcpyW(szName, L"<ordinal>"); // Fallback
+                                            
+                                            for (DWORD j = 0; j < pExportDir->NumberOfNames; ++j) {
+                                                if (pNameOrdinals[j] == i) {
+                                                    char* funcNameA = (char*)pBase + RvaToOffset(pNames[j]);
+                                                    MultiByteToWideChar(CP_ACP, 0, funcNameA, -1, szName, MAX_PATH);
+                                                    break;
+                                                }
+                                            }
+                                            
+                                            LVITEMW lvi = { 0 };
+                                            lvi.mask = LVIF_TEXT;
+                                            lvi.iItem = expItemIndex;
+                                            lvi.iSubItem = 0;
+                                            lvi.pszText = szName; // Index 0: Name
+                                            SendMessageW(hListExp, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+                                            
+                                            lvi.iSubItem = 1; lvi.pszText = szAddr;    SendMessageW(hListExp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+                                            lvi.iSubItem = 2; lvi.pszText = szOrdinal; SendMessageW(hListExp, LVM_SETITEMW, 0, (LPARAM)&lvi);
+                                            
+                                            expItemIndex++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        UnmapViewOfFile(pBase);
+                    }
+                    CloseHandle(hMap);
+                }
+                CloseHandle(hFile);
+            }
+
+            HFONT hModernFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+            SendMessage(hTab, WM_SETFONT, (WPARAM)hModernFont, TRUE);
+            SendMessage(hListImp, WM_SETFONT, (WPARAM)hModernFont, TRUE);
+            SendMessage(hListExp, WM_SETFONT, (WPARAM)hModernFont, TRUE);
+            break;
+        }
+        case WM_NOTIFY: {
+            LPNMHDR lpnmhdr = (LPNMHDR)lParam;
+            if (lpnmhdr->idFrom == ID_TAB_PE && lpnmhdr->code == TCN_SELCHANGE) {
+                int tabIndex = TabCtrl_GetCurSel(lpnmhdr->hwndFrom);
+                HWND hListImp = GetDlgItem(hwnd, ID_LST_IMPORTS);
+                HWND hListExp = GetDlgItem(hwnd, ID_LST_EXPORTS);
+                if (tabIndex == 0) { // Imports
+                    ShowWindow(hListImp, SW_SHOW);
+                    ShowWindow(hListExp, SW_HIDE);
+                } else { // Exports
+                    ShowWindow(hListImp, SW_HIDE);
+                    ShowWindow(hListExp, SW_SHOW);
+                }
+            }
+            break;
+        }
+        case WM_SIZE: {
+            HWND hTab = GetDlgItem(hwnd, ID_TAB_PE);
+            HWND hListImp = GetDlgItem(hwnd, ID_LST_IMPORTS);
+            HWND hListExp = GetDlgItem(hwnd, ID_LST_EXPORTS);
+            int cx = LOWORD(lParam);
+            int cy = HIWORD(lParam);
+            if (hTab) {
+                MoveWindow(hTab, 0, 0, cx, cy, TRUE);
+                RECT rc;
+                GetClientRect(hTab, &rc);
+                TabCtrl_AdjustRect(hTab, FALSE, &rc); // Adjust for inside area
+                if (hListImp) MoveWindow(hListImp, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+                if (hListExp) MoveWindow(hListExp, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+            }
+            break;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            break;
+        case WM_DESTROY: {
+            HWND hOwner = GetWindow(hwnd, GW_OWNER);
+            if (hOwner) {
+                EnableWindow(hOwner, TRUE);
+                SetForegroundWindow(hOwner);
+            }
+            break;
+        }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -726,14 +1018,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HWND hLblDll = CreateWindowW(L"STATIC", L"DLL Name:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 40, 120, 100, 20, hwnd, NULL, NULL, NULL);
             hTxtDll = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 145, 120, 230, 22, hwnd, (HMENU)ID_TXT_DLL, NULL, NULL);
             CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, 380, 120, 30, 22, hwnd, (HMENU)ID_BTN_DLL, NULL, NULL);
+
+            // 4. PE Analyzer:
+            HWND hLblPe = CreateWindowW(L"STATIC", L"PE Analyzer:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 40, 155, 100, 20, hwnd, NULL, NULL, NULL);
+            hTxtPe = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 145, 155, 175, 22, hwnd, (HMENU)ID_TXT_PE, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, 325, 155, 25, 22, hwnd, (HMENU)ID_BTN_PE, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"Analyze", WS_CHILD | WS_VISIBLE, 355, 155, 60, 22, hwnd, (HMENU)ID_BTN_IMPORTS, NULL, NULL);
+
             // 开启 Cue Banner 显示占位符
             SendMessageW(hTxtDll, EM_SETCUEBANNER, (WPARAM)TRUE, (LPARAM)L"<Drag & Drop your DLL here>");
+            SendMessageW(hTxtPe, EM_SETCUEBANNER, (WPARAM)TRUE, (LPARAM)L"<Select PE File to Analyze>");
 
-            // 4. Inject Button (居中)
-            CreateWindowW(L"BUTTON", L"Inject DLL", WS_CHILD | WS_VISIBLE, 190, 165, 100, 30, hwnd, (HMENU)ID_BTN_ACTION, NULL, NULL);
+            // 5. Inject Button (居中)
+            CreateWindowW(L"BUTTON", L"Inject DLL", WS_CHILD | WS_VISIBLE, 190, 195, 100, 30, hwnd, (HMENU)ID_BTN_ACTION, NULL, NULL);
 
-            // 5. Log Area (多行 Edit)
-            hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 30, 215, 400, 255, hwnd, (HMENU)ID_TXT_LOG, NULL, NULL);
+            // 6. Log Area (多行 Edit)
+            hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 30, 240, 400, 230, hwnd, (HMENU)ID_TXT_LOG, NULL, NULL);
 
             // Enable drag drop
             DragAcceptFiles(hwnd, TRUE);
@@ -754,10 +1054,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDROP hDrop = (HDROP)wParam;
             wchar_t filePath[MAX_PATH] = { 0 };
             
+            POINT pt;
+            DragQueryPoint(hDrop, &pt);
+            RECT rcPe;
+            GetWindowRect(hTxtPe, &rcPe);
+            POINT ptScreen = pt;
+            ClientToScreen(hwnd, &ptScreen);
+            
             // 获取拖拽的第一个文件的路径
             if (DragQueryFileW(hDrop, 0, filePath, MAX_PATH) > 0) {
-                // 将文件路径设置到 DLL Name 的 Edit 控件中
-                SetWindowTextW(hTxtDll, filePath);
+                if (PtInRect(&rcPe, ptScreen)) {
+                    SetWindowTextW(hTxtPe, filePath);
+                } else {
+                    SetWindowTextW(hTxtDll, filePath);
+                }
                 
                 // 向日志写入拖拽事件记录
                 wchar_t logBuf[MAX_PATH + 64];
@@ -944,6 +1254,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     break;
                 }
+                case ID_BTN_PE: {
+                    wchar_t szFile[MAX_PATH] = { 0 };
+                    OPENFILENAMEW ofn = { 0 };
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFile = szFile;
+                    ofn.nMaxFile = MAX_PATH;
+                    ofn.lpstrFilter = L"PE Files (*.exe;*.dll;*.sys)\0*.exe;*.dll;*.sys\0All Files (*.*)\0*.*\0";
+                    ofn.nFilterIndex = 1;
+                    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+                    if (GetOpenFileNameW(&ofn)) {
+                        SetWindowTextW(hTxtPe, szFile);
+                    }
+                    break;
+                }
+                case ID_BTN_IMPORTS: {
+                    wchar_t szDll[MAX_PATH] = { 0 };
+                    GetWindowTextW(hTxtPe, szDll, MAX_PATH);
+                    if (szDll[0] == L'\0') {
+                        MessageBoxW(hwnd, L"Please select or drop a DLL file first.", L"Warning", MB_ICONWARNING);
+                        break;
+                    }
+                    if (GetFileAttributesW(szDll) == INVALID_FILE_ATTRIBUTES) {
+                        MessageBoxW(hwnd, L"The specified DLL file does not exist.", L"Error", MB_ICONERROR);
+                        break;
+                    }
+                    
+                    EnableWindow(hwnd, FALSE);
+                    HWND hImpDlg = CreateWindowW(
+                        L"ImportsDlg", L"DLL Imports Viewer (IDA Style)",
+                        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_SIZEBOX | WS_MAXIMIZEBOX,
+                        CW_USEDEFAULT, CW_USEDEFAULT, 620, 450,
+                        hwnd, NULL, g_hInst, NULL
+                    );
+                    break;
+                }
             }
             break;
         }
@@ -988,6 +1334,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcModDlg.hCursor = LoadCursor(NULL, IDC_ARROW);
     wcModDlg.hbrBackground = (HBRUSH)(COLOR_WINDOW);
     RegisterClassW(&wcModDlg);
+
+    const wchar_t IMP_DLG_CLASS_NAME[] = L"ImportsDlg";
+    WNDCLASSW wcImpDlg = {};
+    wcImpDlg.lpfnWndProc = ImportsDlgWndProc;
+    wcImpDlg.hInstance = hInstance;
+    wcImpDlg.lpszClassName = IMP_DLG_CLASS_NAME;
+    wcImpDlg.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcImpDlg.hbrBackground = (HBRUSH)(COLOR_WINDOW);
+    RegisterClassW(&wcImpDlg);
 
     // 注意：在这里添加了 WS_EX_ACCEPTFILES 扩展样式以允许接受拖拽释放的文件
     HWND hwnd = CreateWindowExW(
