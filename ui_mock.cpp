@@ -5,6 +5,8 @@
 #include <commdlg.h>
 #include <shlwapi.h>
 
+#pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
 // 控件 ID 定义
 #define ID_RAD_INJECT 101
 #define ID_RAD_FREE   102
@@ -35,7 +37,7 @@ HWND hProcDlg = NULL;
 HWND hModDlg = NULL;
 HINSTANCE g_hInst;
 
-wchar_t g_injectDllPath[MAX_PATH] = L"<Drag & Drop your DLL here>";
+wchar_t g_injectDllPath[MAX_PATH] = L"";
 wchar_t g_freeDllName[MAX_PATH] = L"";
 int g_currentMode = ID_RAD_INJECT;
 
@@ -227,10 +229,45 @@ bool InjectRemoteDLL_CRT(DWORD processID, const wchar_t* dllPath) {
         CloseHandle(hProcess);
         return false;
     }
+}
 
-    VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
-    CloseHandle(hProcess);
-    return true;
+bool IsDll64Bit(const wchar_t* dllPath, bool& is64Bit) {
+    HANDLE hFile = CreateFileW(dllPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pView) {
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return false;
+    }
+
+    bool success = false;
+    IMAGE_DOS_HEADER* pDos = (IMAGE_DOS_HEADER*)pView;
+    if (pDos->e_magic == IMAGE_DOS_SIGNATURE) {
+        IMAGE_NT_HEADERS* pNt = (IMAGE_NT_HEADERS*)((BYTE*)pView + pDos->e_lfanew);
+        if (pNt->Signature == IMAGE_NT_SIGNATURE) {
+            WORD machine = pNt->FileHeader.Machine;
+            if (machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_IA64) {
+                is64Bit = true;
+                success = true;
+            } else if (machine == IMAGE_FILE_MACHINE_I386) {
+                is64Bit = false;
+                success = true;
+            }
+        }
+    }
+
+    UnmapViewOfFile(pView);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    return success;
 }
 
 bool IsTargetProcess32Bit(DWORD pid) {
@@ -674,46 +711,41 @@ LRESULT CALLBACK ProcDlgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
             // 1. Operation: 
-            HWND hLblOp = CreateWindowW(L"STATIC", L"Operation:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 30, 80, 100, 20, hwnd, NULL, NULL, NULL);
-            HWND hRadInj = CreateWindowW(L"BUTTON", L"Inject DLL", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP, 140, 80, 100, 20, hwnd, (HMENU)ID_RAD_INJECT, NULL, NULL);
-            HWND hRadFree = CreateWindowW(L"BUTTON", L"Free DLL", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 250, 80, 100, 20, hwnd, (HMENU)ID_RAD_FREE, NULL, NULL);
+            HWND hLblOp = CreateWindowW(L"STATIC", L"Operation:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 40, 50, 100, 20, hwnd, NULL, NULL, NULL);
+            HWND hRadInj = CreateWindowW(L"BUTTON", L"Inject DLL", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP, 145, 50, 80, 20, hwnd, (HMENU)ID_RAD_INJECT, NULL, NULL);
+            HWND hRadFree = CreateWindowW(L"BUTTON", L"Free DLL", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 235, 50, 80, 20, hwnd, (HMENU)ID_RAD_FREE, NULL, NULL);
             SendMessage(hRadInj, BM_SETCHECK, BST_CHECKED, 0); // 默认选中 Inject
 
-            // 2. Injection Method:
-            HWND hLblMethod = CreateWindowW(L"STATIC", L"Injection Method:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 30, 110, 100, 20, hwnd, NULL, NULL, NULL);
-            HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 140, 110, 270, 100, hwnd, (HMENU)ID_CMB_METHOD, NULL, NULL);
-            SendMessageA(hCombo, CB_ADDSTRING, 0, (LPARAM)"CreateRemoteThread");
-            SendMessageA(hCombo, CB_ADDSTRING, 0, (LPARAM)"NtCreateThreadEx (Native API)");
-            SendMessageA(hCombo, CB_SETCURSEL, 0, 0); // 默认选中第一项
+            // 2. Target Process: (Moved up)
+            HWND hLblTarget = CreateWindowW(L"STATIC", L"Target Process:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 40, 85, 100, 20, hwnd, NULL, NULL, NULL);
+            hTxtProc = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 145, 85, 230, 22, hwnd, (HMENU)ID_TXT_PROC, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, 380, 85, 30, 22, hwnd, (HMENU)ID_BTN_PROC, NULL, NULL);
 
-            // 3. Target Process:
-            HWND hLblTarget = CreateWindowW(L"STATIC", L"Target Process:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 30, 140, 100, 20, hwnd, NULL, NULL, NULL);
-            hTxtProc = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 140, 140, 240, 22, hwnd, (HMENU)ID_TXT_PROC, NULL, NULL);
-            CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, 385, 140, 25, 22, hwnd, (HMENU)ID_BTN_PROC, NULL, NULL);
+            // 3. DLL Name: (Moved up)
+            HWND hLblDll = CreateWindowW(L"STATIC", L"DLL Name:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 40, 120, 100, 20, hwnd, NULL, NULL, NULL);
+            hTxtDll = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 145, 120, 230, 22, hwnd, (HMENU)ID_TXT_DLL, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, 380, 120, 30, 22, hwnd, (HMENU)ID_BTN_DLL, NULL, NULL);
+            // 开启 Cue Banner 显示占位符
+            SendMessageW(hTxtDll, EM_SETCUEBANNER, (WPARAM)TRUE, (LPARAM)L"<Drag & Drop your DLL here>");
 
-            // 4. DLL Name:
-            HWND hLblDll = CreateWindowW(L"STATIC", L"DLL Name:", WS_CHILD | WS_VISIBLE | SS_RIGHT, 30, 170, 100, 20, hwnd, NULL, NULL, NULL);
-            hTxtDll = CreateWindowW(L"EDIT", L"<Drag & Drop your DLL here>", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 140, 170, 240, 22, hwnd, (HMENU)ID_TXT_DLL, NULL, NULL);
-            CreateWindowW(L"BUTTON", L"...", WS_CHILD | WS_VISIBLE, 385, 170, 25, 22, hwnd, (HMENU)ID_BTN_DLL, NULL, NULL);
+            // 4. Inject Button (居中)
+            CreateWindowW(L"BUTTON", L"Inject DLL", WS_CHILD | WS_VISIBLE, 190, 165, 100, 30, hwnd, (HMENU)ID_BTN_ACTION, NULL, NULL);
 
-            // 5. Inject Button (居中)
-            CreateWindowW(L"BUTTON", L"Inject DLL", WS_CHILD | WS_VISIBLE, 180, 210, 100, 30, hwnd, (HMENU)ID_BTN_ACTION, NULL, NULL);
+            // 5. Log Area (多行 Edit)
+            hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 30, 215, 400, 255, hwnd, (HMENU)ID_TXT_LOG, NULL, NULL);
 
-            // 6. Log Area (多行 Edit)
-            hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 20, 260, 420, 180, hwnd, (HMENU)ID_TXT_LOG, NULL, NULL);
+            // Enable drag drop
+            DragAcceptFiles(hwnd, TRUE);
 
-            // 7. Bottom Buttons
-            CreateWindowW(L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE, 280, 460, 70, 25, hwnd, (HMENU)ID_BTN_CLEAR, NULL, NULL);
-            CreateWindowW(L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE, 370, 460, 70, 25, hwnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
+            // 统一设置所有子窗口的字体为现代 GUI 字体 (Segoe UI)
+            HFONT hModernFont = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+            if (!hModernFont) hModernFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT); // Fallback
 
-            // 统一设置所有子窗口的字体为默认 GUI 字体
             EnumChildWindows(hwnd, [](HWND child, LPARAM font) -> BOOL {
                 SendMessage(child, WM_SETFONT, font, TRUE);
                 return TRUE;
-            }, (LPARAM)hFont);
+            }, (LPARAM)hModernFont);
             
             break;
         }
@@ -772,7 +804,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     wchar_t szDll[MAX_PATH] = {0};
                     GetWindowTextW(hTxtDll, szDll, MAX_PATH);
                     
-                    if (pid == 0 || szDll[0] == L'\0' || lstrcmpiW(szDll, L"<Drag & Drop your DLL here>") == 0) {
+                    if (pid == 0 || szDll[0] == L'\0') {
                         MessageBoxW(hwnd, L"Please select a valid Target Process and DLL.", L"Error", MB_ICONERROR);
                         break;
                     }
@@ -784,8 +816,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         SendMessage(hLog, EM_SETSEL, len, len);
                         SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
                         
+                        bool isDll64 = false;
+                        if (!IsDll64Bit(szDll, isDll64)) {
+                            wsprintfW(logBuf, L"[-] Error: Invalid DLL file or cannot determine architecture.\r\n");
+                            int len = GetWindowTextLength(hLog);
+                            SendMessage(hLog, EM_SETSEL, len, len);
+                            SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
+                            break;
+                        }
+
+                        bool isTarget32 = IsTargetProcess32Bit(pid);
+                        if ((isTarget32 && isDll64) || (!isTarget32 && !isDll64)) {
+                            wsprintfW(logBuf, L"[-] Error: Architecture Mismatch! Target Process is %ls, but DLL is %ls.\r\n", isTarget32 ? L"32-bit" : L"64-bit", isDll64 ? L"64-bit" : L"32-bit");
+                            int len = GetWindowTextLength(hLog);
+                            SendMessage(hLog, EM_SETSEL, len, len);
+                            SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
+                            break;
+                        }
+                        
                         bool success = false;
-                        if (IsTargetProcess32Bit(pid)) {
+                        if (isTarget32) {
                             success = ExtractAndRun32BitInjector(pid, szDll, true);
                         } else {
                             success = FreeRemoteDLL(pid, szDll);
@@ -800,28 +850,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         SendMessage(hLog, EM_SETSEL, len, len);
                         SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
                     } else {
-                        HWND hCombo = GetDlgItem(hwnd, ID_CMB_METHOD);
-                        int selIndex = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
-
                         wchar_t logBuf[1024];
                         wsprintfW(logBuf, L"[*] Attempting to Inject DLL: %s into PID %lu...\r\n", szDll, pid);
                         int len = GetWindowTextLength(hLog);
                         SendMessage(hLog, EM_SETSEL, len, len);
                         SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
 
+                        bool isDll64 = false;
+                        if (!IsDll64Bit(szDll, isDll64)) {
+                            wsprintfW(logBuf, L"[-] Error: Invalid DLL file or cannot determine architecture.\r\n");
+                            int len = GetWindowTextLength(hLog);
+                            SendMessage(hLog, EM_SETSEL, len, len);
+                            SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
+                            break;
+                        }
+
+                        bool isTarget32 = IsTargetProcess32Bit(pid);
+                        if ((isTarget32 && isDll64) || (!isTarget32 && !isDll64)) {
+                            wsprintfW(logBuf, L"[-] Error: Architecture Mismatch! Target Process is %ls, but DLL is %ls.\r\n", isTarget32 ? L"32-bit" : L"64-bit", isDll64 ? L"64-bit" : L"32-bit");
+                            int len = GetWindowTextLength(hLog);
+                            SendMessage(hLog, EM_SETSEL, len, len);
+                            SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
+                            break;
+                        }
+
                         bool success = false;
-                        if (IsTargetProcess32Bit(pid)) {
+                        if (isTarget32) {
                             success = ExtractAndRun32BitInjector(pid, szDll, false);
                         } else {
-                            if (selIndex == 0) {
-                                success = InjectRemoteDLL_CRT(pid, szDll);
-                            } else {
-                                wsprintfW(logBuf, L"[-] NtCreateThreadEx method is mapped but not fully implemented in this sample. Using CreateRemoteThread fallback.\r\n");
-                                len = GetWindowTextLength(hLog);
-                                SendMessage(hLog, EM_SETSEL, len, len);
-                                SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)logBuf);
-                                success = InjectRemoteDLL_CRT(pid, szDll);
-                            }
+                            // We only use CreateRemoteThread now natively
+                            success = InjectRemoteDLL_CRT(pid, szDll);
                         }
 
                         if (success) {
@@ -835,10 +893,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     break;
                 }
-                case ID_BTN_CLEAR: {
-                    SetWindowText(hLog, L"");
-                    break;
-                }
+
                 case ID_BTN_PROC: {
                     if (hProcDlg == NULL) {
                         EnableWindow(hwnd, FALSE);
