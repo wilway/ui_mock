@@ -1,0 +1,10 @@
+// 资源文件定义：指向 bin 目录下的中间产物
+#define IDR_INJ32_EXE      1001
+#define IDR_INJ64_EXE      1002
+#define IDR_MONITOR32_DLL  1003
+#define IDR_MONITOR64_DLL  1004
+
+IDR_INJ32_EXE      BINARY  "bin/inj32.exe"
+IDR_INJ64_EXE      BINARY  "bin/inj64.exe"
+IDR_MONITOR32_DLL  BINARY  "bin/monitor32.dll"
+IDR_MONITOR64_DLL  BINARY  "bin/monitor64.dll"
