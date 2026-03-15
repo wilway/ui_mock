@@ -100,7 +100,6 @@ bool RunExternalInjector(DWORD pid, const wchar_t* injectorName, const wchar_t* 
     if (CreateProcessW(injectorPath, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         DebugLog(L"Started injector: %s", cmdLine);
         // 等待注入操作完成
-        WaitForSingleObject(pi.hProcess, 5000);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return true;
@@ -132,47 +131,27 @@ BOOL WINAPI DetourCreateProcessInternalW(
         );
     }
 
-    // 1. 强制挂起新进程
-    // 注意：某些沙盒或受保护进程不支持 CREATE_SUSPENDED，这里我们暂定通用逻辑
+    // 正常启动新进程
     BOOL result = fpCreateProcessInternalW(
         hToken, lpApplicationName, lpCommandLine, lpProcessAttributes,
-        lpThreadAttributes, bInheritHandles, dwCreationFlags | CREATE_SUSPENDED,
+        lpThreadAttributes, bInheritHandles, dwCreationFlags,
         lpEnvironment, lpCurrentDirectory, lpStartupInfo,
         lpProcessInformation, hNewToken
     );
-
+    DWORD lastErr = GetLastError();
     if (result && lpProcessInformation && lpProcessInformation->hProcess) {
         DWORD targetPid = lpProcessInformation->dwProcessId;
-        
-        // 只有当进程确实被我们额外挂起时（由我们添加了标志），我们才进行注入并负责 Resume
-        // 如果原始调用本就是 SUSPENDED，我们要保留其挂起状态
-        bool weSuspendedIt = !(originalFlags & CREATE_SUSPENDED);
-
         bool targetIs64 = IsProcess64Bit(lpProcessInformation->hProcess);
 
         DebugLog(L"Infecting PID: %lu, Name: %s", targetPid, lpApplicationName ? lpApplicationName : L"Unknown");
 
-        wchar_t configPath[MAX_PATH];
-        lstrcpyW(configPath, g_baseDir);
-        lstrcatW(configPath, L"config.ini");
-
-        wchar_t businessDll[MAX_PATH];
-
         if (targetIs64) {
-            GetPrivateProfileStringW(L"Settings", L"Test64Path", L"test64.dll", businessDll, MAX_PATH, configPath);
             RunExternalInjector(targetPid, L"inj64.exe", L"monitor64.dll");
-            //RunExternalInjector(targetPid, L"inj64.exe", businessDll);
         } else {
-            GetPrivateProfileStringW(L"Settings", L"Test32Path", L"test32.dll", businessDll, MAX_PATH, configPath);
             RunExternalInjector(targetPid, L"inj32.exe", L"monitor32.dll");
-            //RunExternalInjector(targetPid, L"inj32.exe", businessDll);
-        }
-
-        if (weSuspendedIt) {
-            ResumeThread(lpProcessInformation->hThread);
         }
     }
-
+    SetLastError(lastErr);
     return result;
 }
 
@@ -186,6 +165,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             *(lastSlash + 1) = L'\0';
             lstrcpyW(g_baseDir, selfPath);
         }
+
+        // --- 直接在 DllMain 中加载业务 DLL ---
+        wchar_t configPath[MAX_PATH];
+        lstrcpyW(configPath, g_baseDir);
+        lstrcatW(configPath, L"config.ini");
+
+        wchar_t businessDll[MAX_PATH];
+#ifdef _WIN64
+        GetPrivateProfileStringW(L"Settings", L"Test64Path", L"test64.dll", businessDll, MAX_PATH, configPath);
+#else
+        GetPrivateProfileStringW(L"Settings", L"Test32Path", L"test32.dll", businessDll, MAX_PATH, configPath);
+#endif
+
+        wchar_t finalDllPath[MAX_PATH];
+        if (GetFileAttributesW(businessDll) == INVALID_FILE_ATTRIBUTES) {
+            lstrcpyW(finalDllPath, g_baseDir);
+            lstrcatW(finalDllPath, businessDll);
+        } else {
+            lstrcpyW(finalDllPath, businessDll);
+        }
+        LoadLibraryW(finalDllPath);
+        // -------------------------------------
 
         // 初始化 MinHook 库并设置钩子
         if (MH_Initialize() == MH_OK) {

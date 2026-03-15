@@ -123,13 +123,14 @@ int wmain(int argc, wchar_t* argv[]) {
     const wchar_t* dllPath = argv[2];
     DWORD mode = my_wtol(argv[3]);
 
+    DebugLog(L"InjectDLL pid: %d, dllPath: %s, mode: %d", pid, dllPath, mode);
     bool success = false;
     if (mode == 1) { // 卸载模式
         success = FreeRemoteDLL(pid, dllPath);
     } else { // 注入模式
         success = InjectRemoteDLL_CRT(pid, dllPath);
     }
-
+    DebugLog(L"InjectDLL pid: %d, dllPath: %s, mode: %d, result: %d", pid, dllPath, mode, success);
     return success ? 0 : 1;
 }
 
